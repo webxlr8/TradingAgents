@@ -25,10 +25,9 @@ TICKERS = {
     "DOGEUSDT": "DOGE-USD",
 }
 
-# All useful analysts for crypto: market (technicals), news (sentiment),
-# social (social media sentiment). Skip 'fundamentals' — it's SEC-focused
-# and not useful for crypto assets.
-ANALYSTS = ("market", "news", "social")
+# Market + news analysts only — social hangs on crypto tickers with no data.
+# Keeping it fast: ~90s per ticker, all 6 done in ~10 min.
+ANALYSTS = ("market", "news")
 
 
 def load_json(path):
@@ -88,7 +87,7 @@ def main():
         signals = {}
 
     config = DEFAULT_CONFIG.copy()
-    config["max_debate_rounds"] = 2          # More thorough bull/bear debate
+    config["max_debate_rounds"] = 1          # Fast analysis, 1 round
     config["max_risk_discuss_rounds"] = 1
 
     success_count = 0
