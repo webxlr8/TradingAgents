@@ -7,9 +7,16 @@ serve it to strategy-lab's llm_agent strategy.
 Also maintains a trades.json journal that logs signal CHANGES (e.g.,
 BTC went from Hold to Buy) for post-trade analysis.
 
+Key design decisions:
+  - market + news analysts ONLY (social hangs on crypto tickers)
+  - 1 debate round (fast, ~60-90s per ticker)
+  - 60s delay between tickers to avoid Anthropic rate limits
+  - 5-minute timeout per ticker (kills hung API calls)
+  - Push signals to lab.wx8.org after each ticker
+
 Run: python gen_signals.py
 """
-import json, os, sys, time, traceback
+import json, os, sys, time, traceback, signal
 from datetime import datetime, timedelta
 
 HOME_DIR = os.environ.get("TRADINGAGENTS_HOME", os.path.expanduser("~/.tradingagents"))
@@ -25,10 +32,19 @@ TICKERS = {
     "DOGEUSDT": "DOGE-USD",
 }
 
-# All useful analysts for crypto: market (technicals), news (sentiment),
-# social (social media sentiment). Skip 'fundamentals' — it's SEC-focused.
-# StockTwits 403 is non-fatal; the social analyst still contributes Reddit data.
-ANALYSTS = ("market", "news", "social")
+# Market + news only. Social analyst hangs on crypto (StockTwits 403, Reddit slow).
+ANALYSTS = ("market", "news")
+
+# Per-ticker timeout in seconds
+TICKER_TIMEOUT = 300  # 5 minutes max per ticker
+
+
+class TickerTimeout(Exception):
+    pass
+
+
+def _timeout_handler(signum, frame):
+    raise TickerTimeout("Ticker analysis timed out")
 
 
 def load_json(path):
@@ -51,6 +67,24 @@ def save_json(path, data):
     os.replace(tmp, path)
 
 
+def push_signals(signals):
+    """POST signals to strategy-lab so they appear immediately."""
+    push_url = os.environ.get("PUSH_SIGNALS_URL", "https://lab.wx8.org/api/ai-signals")
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            push_url,
+            data=json.dumps(signals).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10)
+        return True
+    except Exception as e:
+        print(f"  Push failed: {e}")
+        return False
+
+
 def log_trade(binance_sym, yahoo_ticker, old_rating, new_rating, decision, date):
     """Append a signal change to the trades journal."""
     trades = load_json(TRADES_LOG)
@@ -69,7 +103,7 @@ def log_trade(binance_sym, yahoo_ticker, old_rating, new_rating, decision, date)
     }
     trades.append(entry)
     save_json(TRADES_LOG, trades)
-    print(f"  -> TRADE JOURNAL: {yahoo_ticker} {old_rating} -> {new_rating}")
+    print(f"  TRADE JOURNAL: {yahoo_ticker} {old_rating} -> {new_rating}")
 
 
 def main():
@@ -77,10 +111,13 @@ def main():
     from tradingagents.graph.trading_graph import TradingAgentsGraph
 
     date = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
-    print(f"Generating signals for {date}")
+    print(f"=== Signal Generation ===")
+    print(f"Date: {date}")
     print(f"Analysts: {ANALYSTS}")
+    print(f"Tickers: {list(TICKERS.keys())}")
+    print(f"Timeout per ticker: {TICKER_TIMEOUT}s")
     print(f"Output: {OUT}")
-    print(f"Trades log: {TRADES_LOG}")
+    sys.stdout.flush()
 
     # Load existing signals (to detect changes)
     signals = load_json(OUT)
@@ -88,17 +125,38 @@ def main():
         signals = {}
 
     config = DEFAULT_CONFIG.copy()
-    config["max_debate_rounds"] = 2          # Thorough bull/bear debate
+    config["max_debate_rounds"] = 1       # Fast: 1 round
     config["max_risk_discuss_rounds"] = 1
 
     success_count = 0
     fail_count = 0
 
-    for binance_sym, yahoo_ticker in TICKERS.items():
-        print(f"\n{'='*50}\n{yahoo_ticker} ({binance_sym})\n{'='*50}")
+    for i, (binance_sym, yahoo_ticker) in enumerate(TICKERS.items()):
+        # Rate limit: wait 60s between tickers (skip before first)
+        if i > 0:
+            print(f"\n  Waiting 60s before next ticker (rate limit)...")
+            sys.stdout.flush()
+            time.sleep(60)
+
+        print(f"\n{'='*50}")
+        print(f"[{i+1}/{len(TICKERS)}] {yahoo_ticker} ({binance_sym})")
+        print(f"{'='*50}")
+        sys.stdout.flush()
+        start = time.time()
+
         try:
+            # Set alarm for per-ticker timeout
+            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.alarm(TICKER_TIMEOUT)
+
             ta = TradingAgentsGraph(selected_analysts=ANALYSTS, config=config)
             state, decision = ta.propagate(yahoo_ticker, date, "crypto")
+
+            # Cancel alarm
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+
+            elapsed = time.time() - start
 
             rating = "Hold"
             dec_lower = (decision or "").lower()
@@ -125,28 +183,38 @@ def main():
             signals[binance_sym] = entry
             signals[yahoo_ticker] = entry
 
-            # Save after each ticker so partial results survive failures
+            # Save after each ticker
             save_json(OUT, signals)
 
-            # Push to strategy-lab API (more reliable than inter-container HTTP)
-            push_url = os.environ.get("PUSH_SIGNALS_URL", "https://lab.wx8.org/api/ai-signals")
-            try:
-                import urllib.request
-                req = urllib.request.Request(push_url, data=json.dumps(signals).encode(),
-                                            headers={"Content-Type": "application/json"}, method="POST")
-                urllib.request.urlopen(req, timeout=10)
-                print(f"  -> {rating} (pushed to {push_url})")
-            except Exception as push_err:
-                print(f"  -> {rating} (push failed: {push_err})")
+            # Push to strategy-lab
+            pushed = push_signals(signals)
+            push_str = "pushed" if pushed else "local only"
+            print(f"  -> {rating} ({elapsed:.0f}s, {push_str})")
+            sys.stdout.flush()
 
             success_count += 1
-        except Exception as e:
-            print(f"  -> FAILED: {e}")
-            traceback.print_exc()
+
+        except TickerTimeout:
+            signal.alarm(0)
+            elapsed = time.time() - start
+            print(f"  -> TIMEOUT after {elapsed:.0f}s")
+            sys.stdout.flush()
             fail_count += 1
 
-    print(f"\nDone. {success_count}/{len(TICKERS)} succeeded, {fail_count} failed -> {OUT}")
-    if fail_count > 0:
+        except Exception as e:
+            signal.alarm(0)
+            elapsed = time.time() - start
+            print(f"  -> FAILED after {elapsed:.0f}s: {e}")
+            traceback.print_exc()
+            sys.stdout.flush()
+            fail_count += 1
+
+    print(f"\n{'='*50}")
+    print(f"DONE: {success_count}/{len(TICKERS)} succeeded, {fail_count} failed")
+    print(f"Signals file: {OUT}")
+    sys.stdout.flush()
+
+    if fail_count > 0 and success_count == 0:
         sys.exit(1)
 
 
