@@ -128,7 +128,17 @@ def main():
             # Save after each ticker so partial results survive failures
             save_json(OUT, signals)
 
-            print(f"  -> {rating}")
+            # Push to strategy-lab API (more reliable than inter-container HTTP)
+            push_url = os.environ.get("PUSH_SIGNALS_URL", "https://lab.wx8.org/api/ai-signals")
+            try:
+                import urllib.request
+                req = urllib.request.Request(push_url, data=json.dumps(signals).encode(),
+                                            headers={"Content-Type": "application/json"}, method="POST")
+                urllib.request.urlopen(req, timeout=10)
+                print(f"  -> {rating} (pushed to {push_url})")
+            except Exception as push_err:
+                print(f"  -> {rating} (push failed: {push_err})")
+
             success_count += 1
         except Exception as e:
             print(f"  -> FAILED: {e}")
