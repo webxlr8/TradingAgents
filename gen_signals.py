@@ -165,9 +165,21 @@ def main():
     counters = {"ok": 0, "fail": 0}
 
     def analyze(yahoo_ticker):
-        ta = TradingAgentsGraph(selected_analysts=ANALYSTS, config=config)
-        state, decision = ta.propagate(yahoo_ticker, date, "crypto")
-        return decision
+        # Gateway models intermittently answer 429/overloaded; retry before
+        # declaring a ticker dead so one blip doesn't blank a signal.
+        attempts = int(os.environ.get("SIGNALS_ATTEMPTS", "3"))
+        last_error = None
+        for attempt in range(1, attempts + 1):
+            try:
+                ta = TradingAgentsGraph(selected_analysts=ANALYSTS, config=config)
+                state, decision = ta.propagate(yahoo_ticker, date, "crypto")
+                return decision
+            except Exception as e:
+                last_error = e
+                log(f"  {yahoo_ticker} attempt {attempt}/{attempts} failed: {str(e)[:160]}")
+                if attempt < attempts:
+                    time.sleep(20 * attempt)
+        raise last_error
 
     def record(binance_sym, yahoo_ticker, decision, elapsed):
         rating = rating_from(decision)
