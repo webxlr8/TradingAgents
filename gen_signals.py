@@ -36,7 +36,7 @@ TICKERS = {
 ANALYSTS = ("market", "news")
 
 # Per-ticker timeout in seconds
-TICKER_TIMEOUT = 300  # 5 minutes max per ticker
+TICKER_TIMEOUT = 900  # 15 minutes max per ticker (gateway models are slower)
 
 
 class TickerTimeout(Exception):
@@ -159,9 +159,9 @@ def main():
     for i, (binance_sym, yahoo_ticker) in enumerate(TICKERS.items()):
         # Rate limit: wait 60s between tickers (skip before first)
         if i > 0:
-            print(f"\n  Waiting 60s before next ticker (rate limit)...")
+            print(f"\n  Waiting 15s before next ticker...")
             sys.stdout.flush()
-            time.sleep(60)
+            time.sleep(15)
 
         print(f"\n{'='*50}")
         print(f"[{i+1}/{len(TICKERS)}] {yahoo_ticker} ({binance_sym})")
