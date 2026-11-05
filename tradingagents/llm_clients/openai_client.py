@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -402,6 +403,23 @@ class OpenAIClient(BaseLLMClient):
             if key == "reasoning_effort" and not _supports_reasoning_effort(self.model):
                 continue
             llm_kwargs[key] = self.kwargs[key]
+
+        # Extra request headers for OpenAI-compatible gateways that route by
+        # session/tenant (e.g. a key that requires x-opencode-session). Set a
+        # JSON object in TRADINGAGENTS_OPENAI_EXTRA_HEADERS; unset means no-op.
+        raw_headers = os.environ.get("TRADINGAGENTS_OPENAI_EXTRA_HEADERS")
+        if raw_headers:
+            try:
+                extra_headers = json.loads(raw_headers)
+            except ValueError:
+                logger.warning(
+                    "TRADINGAGENTS_OPENAI_EXTRA_HEADERS is not valid JSON; ignoring"
+                )
+            else:
+                if isinstance(extra_headers, dict) and extra_headers:
+                    merged = dict(llm_kwargs.get("default_headers") or {})
+                    merged.update({str(k): str(v) for k, v in extra_headers.items()})
+                    llm_kwargs["default_headers"] = merged
 
         # The subclass (provider quirks) comes from the registry spec.
         return chat_cls(**llm_kwargs)

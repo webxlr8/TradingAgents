@@ -107,6 +107,14 @@ def log_trade(binance_sym, yahoo_ticker, old_rating, new_rating, decision, date)
 
 
 def main():
+    # Gateway providers that route per session (e.g. opencode zen) need a
+    # unique session header per run. Set it before any LLM client is created.
+    if not os.environ.get("TRADINGAGENTS_OPENAI_EXTRA_HEADERS"):
+        import uuid
+        os.environ["TRADINGAGENTS_OPENAI_EXTRA_HEADERS"] = json.dumps(
+            {"x-opencode-session": str(uuid.uuid4())}
+        )
+
     from tradingagents.default_config import DEFAULT_CONFIG
     from tradingagents.graph.trading_graph import TradingAgentsGraph
 
@@ -127,6 +135,23 @@ def main():
     config = DEFAULT_CONFIG.copy()
     config["max_debate_rounds"] = 1       # Fast: 1 round
     config["max_risk_discuss_rounds"] = 1
+
+    print(f"Provider: {config.get('llm_provider')}  models: "
+          f"{config.get('deep_think_llm')}/{config.get('quick_think_llm')}")
+    sys.stdout.flush()
+
+    # Fail fast on auth/billing problems instead of burning 6 tickers on them.
+    try:
+        from tradingagents.llm_clients.factory import create_tier_client
+        probe = create_tier_client(config, "quick")
+        probe.get_llm().invoke("Reply with OK")
+        print("LLM preflight: OK")
+    except Exception as e:
+        print(f"LLM preflight FAILED: {str(e)[:300]}")
+        print("Aborting: no signals generated this run.")
+        sys.stdout.flush()
+        sys.exit(2)
+    sys.stdout.flush()
 
     success_count = 0
     fail_count = 0
