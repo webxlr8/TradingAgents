@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-"""Generate LLM trading signals for all 6 crypto tickers.
+"""Generate LLM trading signals for the tracked crypto pairs.
 
 Writes signals.json to TRADINGAGENTS_HOME so the HTTP signals-server can
-serve it to strategy-lab's llm_agent strategy.
+serve it to strategy-lab's llm_agent strategy, and pushes each finished
+signal straight to strategy-lab so the dashboard updates live.
 
-Also maintains a trades.json journal that logs signal CHANGES (e.g.,
-BTC went from Hold to Buy) for post-trade analysis.
+Also maintains a trades.json journal that logs signal CHANGES (e.g. BTC
+went from Hold to Buy) for post-trade analysis.
 
-Key design decisions:
-  - market + news analysts ONLY (social hangs on crypto tickers)
-  - 1 debate round (fast, ~60-90s per ticker)
-  - 60s delay between tickers to avoid Anthropic rate limits
-  - 5-minute timeout per ticker (kills hung API calls)
-  - Push signals to lab.wx8.org after each ticker
+Design notes:
+  - market + news analysts only: the social analyst hangs on crypto tickers
+  - 1 debate round: keeps latency and token cost down
+  - tickers run in a small thread pool so a 4-hourly cycle finishes well
+    inside the task timeout even when the model is slow
+  - one bad ticker never blocks the others; the whole run has a wall-clock
+    budget and reports what it managed to produce
 
 Run: python gen_signals.py
 """
-import json, os, sys, time, traceback, signal
+import json, os, sys, threading, time, traceback, uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 HOME_DIR = os.environ.get("TRADINGAGENTS_HOME", os.path.expanduser("~/.tradingagents"))
@@ -35,20 +38,21 @@ TICKERS = {
 # Market + news only. Social analyst hangs on crypto (StockTwits 403, Reddit slow).
 ANALYSTS = ("market", "news")
 
-# Per-ticker timeout in seconds
-TICKER_TIMEOUT = 900  # 15 minutes max per ticker (gateway models are slower)
+# Parallel workers and an overall wall-clock budget for the whole run.
+WORKERS = int(os.environ.get("SIGNALS_WORKERS", "3"))
+TOTAL_TIMEOUT = int(os.environ.get("SIGNALS_TOTAL_TIMEOUT", "2700"))
+
+_print_lock = threading.Lock()
 
 
-class TickerTimeout(Exception):
-    pass
-
-
-def _timeout_handler(signum, frame):
-    raise TickerTimeout("Ticker analysis timed out")
+def log(msg):
+    with _print_lock:
+        print(msg)
+        sys.stdout.flush()
 
 
 def load_json(path):
-    """Load a JSON file, returning empty dict/list on error."""
+    """Load a JSON file, returning None on error."""
     if os.path.exists(path):
         try:
             with open(path) as f:
@@ -68,7 +72,7 @@ def save_json(path, data):
 
 
 def push_signals(signals):
-    """POST signals to strategy-lab so they appear immediately."""
+    """POST signals to strategy-lab so the dashboard updates immediately."""
     push_url = os.environ.get("PUSH_SIGNALS_URL", "https://lab.wx8.org/api/ai-signals")
     try:
         import urllib.request
@@ -81,7 +85,7 @@ def push_signals(signals):
         urllib.request.urlopen(req, timeout=10)
         return True
     except Exception as e:
-        print(f"  Push failed: {e}")
+        log(f"  push failed: {str(e)[:120]}")
         return False
 
 
@@ -91,7 +95,7 @@ def log_trade(binance_sym, yahoo_ticker, old_rating, new_rating, decision, date)
     if not isinstance(trades, list):
         trades = []
 
-    entry = {
+    trades.append({
         "timestamp": time.time(),
         "datetime": datetime.utcnow().isoformat() + "Z",
         "date": date,
@@ -100,17 +104,26 @@ def log_trade(binance_sym, yahoo_ticker, old_rating, new_rating, decision, date)
         "old_signal": old_rating,
         "new_signal": new_rating,
         "decision_summary": (decision or "")[:500],
-    }
-    trades.append(entry)
+    })
     save_json(TRADES_LOG, trades)
-    print(f"  TRADE JOURNAL: {yahoo_ticker} {old_rating} -> {new_rating}")
+    log(f"  TRADE JOURNAL: {yahoo_ticker} {old_rating} -> {new_rating}")
+
+
+def rating_from(decision):
+    """Map the LLM's free-text decision onto one of four ratings."""
+    rating = "Hold"
+    dec_lower = (decision or "").lower()
+    for word in ["underweight", "sell", "overweight", "buy"]:
+        if word in dec_lower:
+            rating = word.capitalize()
+            break
+    return rating
 
 
 def main():
-    # Gateway providers that route per session (e.g. opencode zen) need a
-    # unique session header per run. Set it before any LLM client is created.
+    # Gateways that route per session (e.g. opencode zen) require a unique
+    # session header per run. Must be set before any LLM client is built.
     if not os.environ.get("TRADINGAGENTS_OPENAI_EXTRA_HEADERS"):
-        import uuid
         os.environ["TRADINGAGENTS_OPENAI_EXTRA_HEADERS"] = json.dumps(
             {"x-opencode-session": str(uuid.uuid4())}
         )
@@ -119,78 +132,46 @@ def main():
     from tradingagents.graph.trading_graph import TradingAgentsGraph
 
     date = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
-    print(f"=== Signal Generation ===")
-    print(f"Date: {date}")
-    print(f"Analysts: {ANALYSTS}")
-    print(f"Tickers: {list(TICKERS.keys())}")
-    print(f"Timeout per ticker: {TICKER_TIMEOUT}s")
-    print(f"Output: {OUT}")
-    sys.stdout.flush()
+    log("=== Signal Generation ===")
+    log(f"Date: {date}")
+    log(f"Analysts: {ANALYSTS}")
+    log(f"Tickers: {list(TICKERS.keys())}")
+    log(f"Workers: {WORKERS}  total budget: {TOTAL_TIMEOUT}s")
+    log(f"Output: {OUT}")
 
-    # Load existing signals (to detect changes)
     signals = load_json(OUT)
     if not isinstance(signals, dict):
         signals = {}
 
     config = DEFAULT_CONFIG.copy()
-    config["max_debate_rounds"] = 1       # Fast: 1 round
+    config["max_debate_rounds"] = 1
     config["max_risk_discuss_rounds"] = 1
 
-    print(f"Provider: {config.get('llm_provider')}  models: "
-          f"{config.get('deep_think_llm')}/{config.get('quick_think_llm')}")
-    sys.stdout.flush()
+    log(f"Provider: {config.get('llm_provider')}  models: "
+        f"{config.get('deep_think_llm')}/{config.get('quick_think_llm')}")
 
-    # Fail fast on auth/billing problems instead of burning 6 tickers on them.
+    # Fail fast on auth/billing problems instead of burning every ticker on them.
     try:
         from tradingagents.llm_clients.factory import create_tier_client
         probe = create_tier_client(config, "quick")
         probe.get_llm().invoke("Reply with OK")
-        print("LLM preflight: OK")
+        log("LLM preflight: OK")
     except Exception as e:
-        print(f"LLM preflight FAILED: {str(e)[:300]}")
-        print("Aborting: no signals generated this run.")
-        sys.stdout.flush()
+        log(f"LLM preflight FAILED: {str(e)[:300]}")
+        log("Aborting: no signals generated this run.")
         sys.exit(2)
-    sys.stdout.flush()
 
-    success_count = 0
-    fail_count = 0
+    state_lock = threading.Lock()
+    counters = {"ok": 0, "fail": 0}
 
-    for i, (binance_sym, yahoo_ticker) in enumerate(TICKERS.items()):
-        # Rate limit: wait 60s between tickers (skip before first)
-        if i > 0:
-            print(f"\n  Waiting 15s before next ticker...")
-            sys.stdout.flush()
-            time.sleep(15)
+    def analyze(yahoo_ticker):
+        ta = TradingAgentsGraph(selected_analysts=ANALYSTS, config=config)
+        state, decision = ta.propagate(yahoo_ticker, date, "crypto")
+        return decision
 
-        print(f"\n{'='*50}")
-        print(f"[{i+1}/{len(TICKERS)}] {yahoo_ticker} ({binance_sym})")
-        print(f"{'='*50}")
-        sys.stdout.flush()
-        start = time.time()
-
-        try:
-            # Set alarm for per-ticker timeout
-            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-            signal.alarm(TICKER_TIMEOUT)
-
-            ta = TradingAgentsGraph(selected_analysts=ANALYSTS, config=config)
-            state, decision = ta.propagate(yahoo_ticker, date, "crypto")
-
-            # Cancel alarm
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old_handler)
-
-            elapsed = time.time() - start
-
-            rating = "Hold"
-            dec_lower = (decision or "").lower()
-            for word in ["underweight", "sell", "overweight", "buy"]:
-                if word in dec_lower:
-                    rating = word.capitalize()
-                    break
-
-            # Check for signal change
+    def record(binance_sym, yahoo_ticker, decision, elapsed):
+        rating = rating_from(decision)
+        with state_lock:
             old_entry = signals.get(binance_sym)
             old_rating = old_entry.get("rating", "None") if old_entry else "None"
             if old_rating != rating:
@@ -207,39 +188,47 @@ def main():
             }
             signals[binance_sym] = entry
             signals[yahoo_ticker] = entry
-
-            # Save after each ticker
             save_json(OUT, signals)
-
-            # Push to strategy-lab
             pushed = push_signals(signals)
-            push_str = "pushed" if pushed else "local only"
-            print(f"  -> {rating} ({elapsed:.0f}s, {push_str})")
-            sys.stdout.flush()
+            counters["ok"] += 1
 
-            success_count += 1
+        log(f"  -> {yahoo_ticker} {rating} ({elapsed:.0f}s, "
+            f"{'pushed' if pushed else 'local only'})")
 
-        except TickerTimeout:
-            signal.alarm(0)
+    pool = ThreadPoolExecutor(max_workers=WORKERS)
+    futures = {pool.submit(analyze, y): (b, y) for b, y in TICKERS.items()}
+    start = time.time()
+    deadline = start + TOTAL_TIMEOUT
+    pending = dict(futures)
+
+    while pending and time.time() < deadline:
+        for fut in list(pending):
+            if not fut.done():
+                continue
+            binance_sym, yahoo_ticker = pending.pop(fut)
             elapsed = time.time() - start
-            print(f"  -> TIMEOUT after {elapsed:.0f}s")
-            sys.stdout.flush()
-            fail_count += 1
+            try:
+                decision = fut.result()
+            except Exception as e:
+                with state_lock:
+                    counters["fail"] += 1
+                log(f"  -> {yahoo_ticker} FAILED after {elapsed:.0f}s: {str(e)[:220]}")
+                traceback.print_exc()
+                continue
+            record(binance_sym, yahoo_ticker, decision, elapsed)
+        if pending:
+            time.sleep(5)
 
-        except Exception as e:
-            signal.alarm(0)
-            elapsed = time.time() - start
-            print(f"  -> FAILED after {elapsed:.0f}s: {e}")
-            traceback.print_exc()
-            sys.stdout.flush()
-            fail_count += 1
+    for fut, (binance_sym, yahoo_ticker) in pending.items():
+        with state_lock:
+            counters["fail"] += 1
+        log(f"  -> {yahoo_ticker} ABANDONED (run budget {TOTAL_TIMEOUT}s exhausted)")
 
-    print(f"\n{'='*50}")
-    print(f"DONE: {success_count}/{len(TICKERS)} succeeded, {fail_count} failed")
-    print(f"Signals file: {OUT}")
-    sys.stdout.flush()
+    log("=" * 50)
+    log(f"DONE: {counters['ok']}/{len(TICKERS)} succeeded, {counters['fail']} failed")
+    log(f"Signals file: {OUT}")
 
-    if fail_count > 0 and success_count == 0:
+    if counters["ok"] == 0:
         sys.exit(1)
 
 
