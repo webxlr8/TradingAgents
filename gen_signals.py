@@ -198,21 +198,34 @@ def main():
     state_lock = threading.Lock()
     counters = {"ok": 0, "fail": 0}
 
+    # A shared gateway will sometimes answer 429/overloaded for minutes at a
+    # time. Retrying the same model then just burns the run budget, so after
+    # the retries we fall back to a different model, then to the next one.
+    attempts = int(os.environ.get("SIGNALS_ATTEMPTS", "3"))
+    fallbacks = [m.strip() for m in
+                 os.environ.get("SIGNALS_FALLBACK_MODELS", "glm-5.3,deepseek-v4-pro").split(",")
+                 if m.strip()]
+    model_variants = [None] + fallbacks
+
     def analyze(yahoo_ticker):
-        # Gateway models intermittently answer 429/overloaded; retry before
-        # declaring a ticker dead so one blip doesn't blank a signal.
-        attempts = int(os.environ.get("SIGNALS_ATTEMPTS", "3"))
+        import random
         last_error = None
-        for attempt in range(1, attempts + 1):
-            try:
-                ta = TradingAgentsGraph(selected_analysts=ANALYSTS, config=config)
-                state, decision = ta.propagate(yahoo_ticker, date, "crypto")
-                return decision, state
-            except Exception as e:
-                last_error = e
-                log(f"  {yahoo_ticker} attempt {attempt}/{attempts} failed: {str(e)[:160]}")
-                if attempt < attempts:
-                    time.sleep(20 * attempt)
+        for model in model_variants:
+            cfg = config if model is None else {**config, "deep_think_llm": model}
+            label = model or config.get("deep_think_llm")
+            for attempt in range(1, attempts + 1):
+                try:
+                    ta = TradingAgentsGraph(selected_analysts=ANALYSTS, config=cfg)
+                    state, decision = ta.propagate(yahoo_ticker, date, "crypto")
+                    return decision, state
+                except Exception as e:
+                    last_error = e
+                    log(f"  {yahoo_ticker} [{label}] attempt {attempt}/{attempts} failed: {str(e)[:140]}")
+                    if attempt < attempts:
+                        # Back off longer and jittered: the gateway overloads
+                        # in bursts, so hammering it on a fixed short delay
+                        # makes it worse.
+                        time.sleep(30 * attempt + random.uniform(0, 15))
         raise last_error
 
     def record(binance_sym, yahoo_ticker, decision, state, elapsed):
