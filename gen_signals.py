@@ -89,7 +89,7 @@ def push_signals(signals):
         return False
 
 
-def log_trade(binance_sym, yahoo_ticker, old_rating, new_rating, decision, date):
+def log_trade(binance_sym, yahoo_ticker, old_rating, new_rating, decision, date, entry_price=None):
     """Append a signal change to the trades journal."""
     trades = load_json(TRADES_LOG)
     if not isinstance(trades, list):
@@ -104,6 +104,7 @@ def log_trade(binance_sym, yahoo_ticker, old_rating, new_rating, decision, date)
         "old_signal": old_rating,
         "new_signal": new_rating,
         "decision_summary": (decision or "")[:500],
+        "entry_price": entry_price,
     })
     save_json(TRADES_LOG, trades)
     log(f"  TRADE JOURNAL: {yahoo_ticker} {old_rating} -> {new_rating}")
@@ -118,6 +119,39 @@ def rating_from(decision):
             rating = word.capitalize()
             break
     return rating
+
+
+def spot_price(binance_symbol):
+    """Latest spot price from Binance (public endpoint, no key needed)."""
+    try:
+        import urllib.request
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={binance_symbol}"
+        with urllib.request.urlopen(url, timeout=8) as r:
+            return float(json.loads(r.read())["price"])
+    except Exception:
+        return None
+
+
+def build_report(state, decision):
+    """Pick the most decision-relevant text out of the agent graph state."""
+    if not isinstance(state, dict):
+        return (decision or "")[:1500]
+
+    parts = []
+    debate = state.get("investment_debate_state") or {}
+    if isinstance(debate, dict) and debate.get("judge_decision"):
+        parts.append(str(debate["judge_decision"]).strip())
+    if state.get("trader_investment_plan"):
+        parts.append(str(state["trader_investment_plan"]).strip())
+    risk = state.get("risk_debate_state") or {}
+    if isinstance(risk, dict) and risk.get("judge_decision"):
+        parts.append(str(risk["judge_decision"]).strip())
+    if state.get("final_trade_decision"):
+        parts.append(str(state["final_trade_decision"]).strip())
+    if not parts:
+        parts.append((decision or "").strip())
+    text = "\n\n".join(p for p in parts if p)
+    return text[:1500]
 
 
 def main():
@@ -173,7 +207,7 @@ def main():
             try:
                 ta = TradingAgentsGraph(selected_analysts=ANALYSTS, config=config)
                 state, decision = ta.propagate(yahoo_ticker, date, "crypto")
-                return decision
+                return decision, state
             except Exception as e:
                 last_error = e
                 log(f"  {yahoo_ticker} attempt {attempt}/{attempts} failed: {str(e)[:160]}")
@@ -181,13 +215,14 @@ def main():
                     time.sleep(20 * attempt)
         raise last_error
 
-    def record(binance_sym, yahoo_ticker, decision, elapsed):
+    def record(binance_sym, yahoo_ticker, decision, state, elapsed):
         rating = rating_from(decision)
+        price = spot_price(binance_sym)
         with state_lock:
             old_entry = signals.get(binance_sym)
             old_rating = old_entry.get("rating", "None") if old_entry else "None"
             if old_rating != rating:
-                log_trade(binance_sym, yahoo_ticker, old_rating, rating, decision, date)
+                log_trade(binance_sym, yahoo_ticker, old_rating, rating, decision, date, price)
 
             entry = {
                 "ticker": yahoo_ticker,
@@ -197,6 +232,8 @@ def main():
                 "date": date,
                 "analysts": list(ANALYSTS),
                 "debate_rounds": config["max_debate_rounds"],
+                "entry_price": price,
+                "report": build_report(state, decision),
             }
             signals[binance_sym] = entry
             signals[yahoo_ticker] = entry
@@ -220,14 +257,14 @@ def main():
             binance_sym, yahoo_ticker = pending.pop(fut)
             elapsed = time.time() - start
             try:
-                decision = fut.result()
+                decision, state = fut.result()
             except Exception as e:
                 with state_lock:
                     counters["fail"] += 1
                 log(f"  -> {yahoo_ticker} FAILED after {elapsed:.0f}s: {str(e)[:220]}")
                 traceback.print_exc()
                 continue
-            record(binance_sym, yahoo_ticker, decision, elapsed)
+            record(binance_sym, yahoo_ticker, decision, state, elapsed)
         if pending:
             time.sleep(5)
 
